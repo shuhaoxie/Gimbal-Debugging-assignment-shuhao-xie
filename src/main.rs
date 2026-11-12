@@ -19,6 +19,23 @@ const TICK: Duration = Duration::from_millis(1);
 const YAW_FEEDBACK_ID :Option<u16>= None;
 const PITCH_FEEDBACK_ID :Option<u16>= None;
 const MOTOR_VOLTAGE_LIMIT:f32 =0.0;
+const FEEDBACK_TIME_OUT_TICKS: u16=20;
+const PREPARE_ANGLE_TOLERANCE_RAD: f32=0.02;
+const PREPARE_SPEED_TOLERANCE_RPM: f32=2.0;
+const PREPARE_STABLE_TICKS:u32=200;
+const PREPARE_TIMEOUT_TICKS:u32=5000;
+const PREPARE_MAX_RPM: f32 = 0.0;
+const PREPARE_MAX_VOLTAGE: f32 = 0.0;
+const RUNNING_MAX_RPM: f32 = 0.0;
+const RUNNING_MAX_VOLTAGE: f32 = 0.0;
+const STALL_MIN_TARGET_RPM: f32 = 5.0;
+const STALL_MAX_ACTUAL_RPM: f32 = 1.0;
+const STALL_MIN_VOLTAGE: f32 = 1000.0;
+const STALL_DURATION_TICKS: u32 = 300;
+const OSC_MIN_SPEED_RPM: f32 = 1.0;
+const OSC_MIN_SWING_RAD: f32 = 0.02;
+const OSC_MAX_FREQUENCY_HZ: f32 = 8.0;
+const OSC_DURATION_TICKS: u32 = 500;
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -135,6 +152,18 @@ pub struct Axis {
     pub position_pid: Pid,
     /// Speed loop: rpm in, voltage counts out.
     pub speed_pid: Pid,
+    pub reference_angle_rad: Option<f32>,
+    pub min_target_angle_rad: Option<f32>,
+    pub max_target_angle_rad: Option<f32>,
+    pub stick_rate_rad_s: f32,
+    pub stall_ticks: u32,
+    pub previous_motion_direction: i8,
+    pub oscillation_clock_ticks: u32,
+    pub oscillation_last_turn_angle: Option<f32>,
+    pub oscillation_last_cycle_tick: Option<u32>,
+    pub oscillation_valid_halves: u8,
+    pub oscillation_fast_ticks: u32,
+    pub oscillation_frequency_hz: f32,
 }
 
 impl Axis{
@@ -150,6 +179,210 @@ impl Axis{
             dt_s,
         );
     }
+
+    pub fn update_target_from_stick(&mut self, input: f32, dt_s: f32) -> bool {
+        let min_angle = match self.min_target_angle_rad {
+            Some(angle) => angle,
+            None => return false,
+        };
+    
+        let max_angle = match self.max_target_angle_rad {
+            Some(angle) => angle,
+            None => return false,
+        };
+    
+        if !min_angle.is_finite() || !max_angle.is_finite() || min_angle >= max_angle {
+            return false;
+        }
+    
+        if !self.stick_rate_rad_s.is_finite() {
+            return false;
+        }
+    
+        if !(min_angle..=max_angle).contains(&self.target_angle_rad) {
+            return false;
+        }
+    
+        let change = input * self.stick_rate_rad_s * dt_s;
+        let next_target = self.target_angle_rad + change;
+    
+        self.target_angle_rad = next_target.clamp(min_angle, max_angle);
+    
+        true
+    }
+
+    pub fn current_position_is_allowed(&self) -> bool {
+        let min_angle = match self.min_target_angle_rad {
+            Some(angle) => angle,
+            None => return false,
+        };
+    
+        let max_angle = match self.max_target_angle_rad {
+            Some(angle) => angle,
+            None => return false,
+        };
+    
+        min_angle.is_finite()
+            && max_angle.is_finite()
+            && min_angle < max_angle
+            && self.stick_rate_rad_s.is_finite()
+            && (min_angle..=max_angle).contains(&self.motor.angle_rad)
+    }
+
+    pub fn is_stall_candidate(
+        &self,
+        min_target_rpm: f32,
+        max_actual_rpm: f32,
+        min_voltage: f32,
+    ) -> bool {
+        let wants_to_move = self.target_rpm.abs() > min_target_rpm;
+    
+        let sent_voltage =
+            i16::from_be_bytes(self.motor.command_bytes(MOTOR_VOLTAGE_LIMIT));
+    
+        let output_large = (sent_voltage as f32).abs() > min_voltage;
+        let moving_slowly = self.motor.speed_rpm.abs() < max_actual_rpm;
+    
+        wants_to_move && output_large && moving_slowly
+    }
+
+    pub fn update_stall_detection(&mut self) -> bool {
+        let suspicious = self.is_stall_candidate(
+            STALL_MIN_TARGET_RPM,
+            STALL_MAX_ACTUAL_RPM,
+            STALL_MIN_VOLTAGE,
+        );
+    
+        if suspicious {
+            self.stall_ticks = self.stall_ticks.saturating_add(1);
+        } else {
+            self.stall_ticks = 0;
+        }
+    
+        self.stall_ticks >= STALL_DURATION_TICKS
+    }
+
+    pub fn reset_control(&mut self){
+        self.target_rpm=0.0;
+        self.position_pid.reset();
+        self.speed_pid.reset();
+        self.motor.disable();
+        self.stall_ticks = 0;
+        self.previous_motion_direction = 0;
+        self.reset_oscillation_detection();
+        
+    }
+
+    pub fn is_settled(&self, angle_tolerance_rad: f32, speed_tolerance_rpm: f32)->bool{
+        let angle_error=(self.target_angle_rad-self.motor.angle_rad).abs();
+        let actual_speed=self.motor.speed_rpm.abs();
+        let angle_ok=angle_error< angle_tolerance_rad;
+        let speed_ok=actual_speed< speed_tolerance_rpm;
+        angle_ok && speed_ok
+    }
+
+    pub fn motion_direction(&self, min_speed_rpm: f32) -> i8 {
+        let speed = self.motor.speed_rpm;
+    
+        if speed > min_speed_rpm {
+            1
+        } else if speed < -min_speed_rpm {
+            -1
+        } else {
+            0
+        }
+    }
+
+    pub fn detect_direction_change(&mut self, min_speed_rpm: f32) -> bool {
+        let current = self.motion_direction(min_speed_rpm);
+    
+        if current == 0 {
+            return false;
+        }
+    
+        let changed =
+            self.previous_motion_direction != 0
+            && current != self.previous_motion_direction;
+    
+        self.previous_motion_direction = current;
+    
+        changed
+    }
+
+    pub fn reset_oscillation_detection(&mut self) {
+        self.previous_motion_direction = 0;
+        self.oscillation_clock_ticks = 0;
+        self.oscillation_last_turn_angle = None;
+        self.oscillation_last_cycle_tick = None;
+        self.oscillation_valid_halves = 0;
+        self.oscillation_fast_ticks = 0;
+        self.oscillation_frequency_hz = 0.0;
+    }
+    
+    pub fn update_oscillation_detection(&mut self) -> bool {
+        self.oscillation_clock_ticks =
+            self.oscillation_clock_ticks.saturating_add(1);
+    
+        let now = self.oscillation_clock_ticks;
+    
+        // 太久没有完成一次往返，就不再算连续高频摆动。
+        if let Some(last) = self.oscillation_last_cycle_tick {
+            let elapsed = now.saturating_sub(last);
+            if elapsed as f32 > 1000.0 / OSC_MAX_FREQUENCY_HZ {
+                self.oscillation_fast_ticks = 0;
+                self.oscillation_frequency_hz = 0.0;
+            }
+        }
+    
+        if !self.detect_direction_change(OSC_MIN_SPEED_RPM) {
+            return false;
+        }
+    
+        let angle = self.motor.angle_rad;
+    
+        let amplitude_ok = match self.oscillation_last_turn_angle {
+            Some(last) => (angle - last).abs() >= OSC_MIN_SWING_RAD,
+            None => false,
+        };
+    
+        self.oscillation_last_turn_angle = Some(angle);
+    
+        if amplitude_ok {
+            self.oscillation_valid_halves =
+                self.oscillation_valid_halves.saturating_add(1);
+        } else {
+            self.oscillation_valid_halves = 0;
+            self.oscillation_fast_ticks = 0;
+        }
+    
+        // 只在转为正向时结算周期，避免把半个往返算成一整次。
+        if self.previous_motion_direction != 1 {
+            return false;
+        }
+    
+        if let Some(last) = self.oscillation_last_cycle_tick {
+            let period_ticks = now.saturating_sub(last);
+    
+            if period_ticks > 0 && self.oscillation_valid_halves >= 2 {
+                self.oscillation_frequency_hz = 1000.0 / period_ticks as f32;
+    
+                if self.oscillation_frequency_hz > OSC_MAX_FREQUENCY_HZ {
+                    self.oscillation_fast_ticks =
+                        self.oscillation_fast_ticks.saturating_add(period_ticks);
+                } else {
+                    self.oscillation_fast_ticks = 0;
+                }
+            } else {
+                self.oscillation_fast_ticks = 0;
+                self.oscillation_frequency_hz = 0.0;
+            }
+        }
+    
+        self.oscillation_last_cycle_tick = Some(now);
+        self.oscillation_valid_halves = 0;
+    
+        self.oscillation_fast_ticks >= OSC_DURATION_TICKS
+    }
 }
 
 /// State shared by every control tick.
@@ -162,6 +395,10 @@ pub struct Control {
     pub remote_silent_ticks: u16,
     pub yaw_feedback_age_ticks: u16,
     pub pitch_feedback_age_ticks: u16,
+    pub previous_right_switch: Option<u8>,
+    pub prepare_ticks: u32,
+    pub prepare_stable_ticks: u32,
+    pub recovery_armed: bool,
 }
 
 /// Start in `Waiting` with no remote input.
@@ -176,6 +413,10 @@ impl Default for Control {
             remote_silent_ticks: REMOTE_SILENT_TICKS,
             yaw_feedback_age_ticks: u16::MAX,
             pitch_feedback_age_ticks: u16::MAX,
+            previous_right_switch: None,
+            prepare_ticks:0,
+            prepare_stable_ticks:0,
+            recovery_armed: false,
         }
     }
 }
@@ -191,11 +432,137 @@ fn fill_motor_command(data:&mut[u8;8], feedback_id:Option<u16>, command: [u8;2])
     data[start+1]=command[1];
 }
 
+fn shortest_angle_error(target:f32, actual:f32) ->f32{
+    let mut error=target-actual;
+    let pi = core::f32::consts::PI;
+    let tau = core::f32::consts::TAU;
+
+    if error > pi {
+        error -= tau;
+    } else if error < -pi {
+        error += tau;
+    }
+
+    error
+}
+
+fn normalize_stick(raw: i16) -> f32 {
+    let input = (raw as f32 / 660.0).clamp(-1.0, 1.0);
+
+    if input.abs() < 0.05 {
+        0.0
+    } else {
+        input
+    }
+}
+
 impl Control {
     /// Clear both motors' voltage commands in RAM.
     pub fn disable_all(&mut self) {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
+    }
+
+    pub fn check_stalls(&mut self) {
+        if self.state != State::Prepare && self.state != State::Running {
+            return;
+        }
+    
+        let yaw_stalled = self.yaw.update_stall_detection();
+        let pitch_stalled = self.pitch.update_stall_detection();
+    
+        if yaw_stalled || pitch_stalled {
+            self.disable_all();
+            self.state = State::Error;
+    
+            if yaw_stalled {
+                rtt_target::rprintln!("Fault: yaw suspected stall");
+            }
+    
+            if pitch_stalled {
+                rtt_target::rprintln!("Fault: pitch suspected stall");
+            }
+        }
+    }
+
+    pub fn check_oscillations(&mut self) {
+        if self.state != State::Prepare && self.state != State::Running {
+            return;
+        }
+    
+        let yaw_fault = self.yaw.update_oscillation_detection();
+        let pitch_fault = self.pitch.update_oscillation_detection();
+    
+        if yaw_fault || pitch_fault {
+            self.disable_all();
+            self.state = State::Error;
+    
+            if yaw_fault {
+                rtt_target::rprintln!(
+                    "Fault: yaw oscillation {:.1} Hz",
+                    self.yaw.oscillation_frequency_hz,
+                );
+            }
+    
+            if pitch_fault {
+                rtt_target::rprintln!(
+                    "Fault: pitch oscillation {:.1} Hz",
+                    self.pitch.oscillation_frequency_hz,
+                );
+            }
+        }
+    }
+
+    pub fn feedback_is_fresh(&self)->bool{
+        let yaw_fresh=self.yaw_feedback_age_ticks < FEEDBACK_TIME_OUT_TICKS;
+        let pitch_fresh=self.pitch_feedback_age_ticks < FEEDBACK_TIME_OUT_TICKS;
+        yaw_fresh && pitch_fresh
+    }
+
+    pub fn take_enable_request(&mut self)->bool{
+        let current=match self.remote{
+            Some(remote)=>Some(remote.right_switch),
+            None=>None,
+        };
+        let enable_requested=
+            self.previous_right_switch==Some(2) && current==Some(3);
+        self.previous_right_switch=current;
+        enable_requested
+    }
+
+    pub fn take_recovery_request(&mut self) -> bool {
+        if self.state != State::Error {
+            self.recovery_armed = false;
+            return false;
+        }
+    
+        let remote = match self.remote {
+            Some(remote) => remote,
+            None => {
+                self.recovery_armed = false;
+                return false;
+            }
+        };
+    
+        if remote.right_switch != 3 {
+            self.recovery_armed = false;
+            return false;
+        }
+    
+        if remote.left_switch == 2 {
+            self.recovery_armed = true;
+        } else if remote.left_switch == 1 {
+            let requested = self.recovery_armed;
+            self.recovery_armed = false;
+    
+            let stick_centered =
+                normalize_stick(remote.channels[2]) == 0.0
+                && normalize_stick(remote.channels[3]) == 0.0;
+    
+            return requested && stick_centered;
+        }
+    
+        false
     }
 
     /// Runs every 1 ms: read the remote and motor feedback, update the state, then
@@ -208,6 +575,8 @@ impl Control {
             self.state = State::Waiting;
         }
         self.update();
+        self.check_stalls();
+        self.check_oscillations();
         self.transmit(can);
     }
 
@@ -270,19 +639,101 @@ impl Control {
     /// Choose the state from the remote, feedback and fault conditions.
     // TODO: the transitions, and initialising targets and PIDs on entering a state.
     pub fn update_mode(&mut self) {
+        let enable_request=self.take_enable_request();
+        let recovery_request = self.take_recovery_request();
+        let enable=match self.remote{
+            Some(remote)=>remote.right_switch==3,
+            None=>false,
+        };
+
+        if !enable || !self.feedback_is_fresh(){
+            self.disable_all();
+            if self.state!=State::Error{
+                self.state=State::Waiting;
+            }
+            return;
+        }
+
         match self.state {
             State::Waiting => {
-                // TODO: enter Prepare after valid feedback and a new enable request.
+                let reference_ready=
+                    self.yaw.reference_angle_rad.is_some()
+                    && self.pitch.reference_angle_rad.is_some();
+
+                if enable_request && self.feedback_is_fresh() && reference_ready{
+                    self.yaw.reset_control();
+                    self.pitch.reset_control();
+
+                    if let Some(angle)=self.yaw.reference_angle_rad{
+                        self.yaw.target_angle_rad=angle;
+                    }
+                    if let Some(angle)=self.pitch.reference_angle_rad{
+                        self.pitch.target_angle_rad=angle;
+                    }
+                    self.prepare_ticks=0;
+                    self.prepare_stable_ticks=0;
+                    self.state=State::Prepare;
+                }
             }
             State::Prepare => {
-                // TODO: enter Running once recentering settles; stop on a timeout or fault.
+                self.prepare_ticks=self.prepare_ticks.saturating_add(1);
+                let yaw_settled=self.yaw.is_settled(
+                    PREPARE_ANGLE_TOLERANCE_RAD,
+                    PREPARE_SPEED_TOLERANCE_RPM,
+                );
+                let pitch_settled=self.pitch.is_settled(
+                    PREPARE_ANGLE_TOLERANCE_RAD,
+                    PREPARE_SPEED_TOLERANCE_RPM,
+                );
+                if yaw_settled && pitch_settled{
+                    self.prepare_stable_ticks=
+                        self.prepare_stable_ticks.saturating_add(1);
+                }
+                else{
+                    self.prepare_stable_ticks=0;
+                }
+
+                if self.prepare_ticks>=PREPARE_TIMEOUT_TICKS{
+                    self.disable_all();
+                    self.state=State::Error;
+                    rtt_target::rprintln!("Prepare timeout");
+                }
+                else if self.prepare_stable_ticks>=PREPARE_STABLE_TICKS{
+                    self.state=State::Running;
+                    rtt_target::rprintln!("Prepare complete");
+                }
             }
             State::Running => {
                 // TODO: handle disable/feedback loss; stall or sustained high-frequency oscillation enters Error.
             }
             State::Error => {
-                // TODO: keep zero output until a new remote recovery gesture; hold current angles,
-                // clear PID history and detection counters, then return to Running.
+                if recovery_request {
+                    let yaw_allowed = self.yaw.current_position_is_allowed();
+                    let pitch_allowed = self.pitch.current_position_is_allowed();
+            
+                    if yaw_allowed && pitch_allowed {
+                        self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+                        self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+            
+                        self.yaw.reset_control();
+                        self.pitch.reset_control();
+            
+                        self.prepare_ticks = 0;
+                        self.prepare_stable_ticks = 0;
+            
+                        self.state = State::Running;
+            
+                        rtt_target::rprintln!(
+                            "Recovered: yaw target={:.3}, pitch target={:.3}; histories reset",
+                            self.yaw.target_angle_rad,
+                            self.pitch.target_angle_rad,
+                        );
+                    } else {
+                        rtt_target::rprintln!(
+                            "Recovery refused: check angle limits and current positions"
+                        );
+                    }
+                }
             }
         }
     }
@@ -290,7 +741,62 @@ impl Control {
     /// Set targets for the current state, run each axis's PIDs and write the voltage commands.
     // TODO: limited recentering in Prepare, remote cascade control in Running, and
     // `disable_all` in Waiting and Error. Each tick is 0.001 s.
-    pub fn update(&mut self) {}
+    pub fn update(&mut self) {
+        match self.state {
+            State::Waiting => {
+                self.disable_all();
+            }
+    
+            State::Prepare => {
+                self.yaw.position_pid.maxout = PREPARE_MAX_RPM;
+                self.pitch.position_pid.maxout = PREPARE_MAX_RPM;
+    
+                self.yaw.speed_pid.maxout = PREPARE_MAX_VOLTAGE;
+                self.pitch.speed_pid.maxout = PREPARE_MAX_VOLTAGE;
+    
+                self.yaw.calculate_output(0.001);
+                self.pitch.calculate_output(0.001);
+            }
+    
+            State::Running => {
+                self.yaw.position_pid.maxout = RUNNING_MAX_RPM;
+                self.pitch.position_pid.maxout = RUNNING_MAX_RPM;
+    
+                self.yaw.speed_pid.maxout = RUNNING_MAX_VOLTAGE;
+                self.pitch.speed_pid.maxout = RUNNING_MAX_VOLTAGE;
+
+                let remote = match self.remote {
+                    Some(remote) => remote,
+                    None => {
+                        self.disable_all();
+                        self.state = State::Waiting;
+                        return;
+                    }
+                };
+                
+                let yaw_input = normalize_stick(remote.channels[2]);
+                let pitch_input = normalize_stick(remote.channels[3]);
+                
+                let yaw_ok = self.yaw.update_target_from_stick(yaw_input, 0.001);
+                let pitch_ok = self.pitch.update_target_from_stick(pitch_input, 0.001);
+                
+                if !yaw_ok || !pitch_ok {
+                    self.disable_all();
+                    self.state = State::Waiting;
+                    return;
+                }
+    
+                self.yaw.calculate_output(0.001);
+                self.pitch.calculate_output(0.001);
+            }
+    
+            State::Error => {
+                self.disable_all();
+            }
+        }
+    }
+
+
 
     /// Queue one group command frame on CAN1 without waiting. This runs every tick, so a
     /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
