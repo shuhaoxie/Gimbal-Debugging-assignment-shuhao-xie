@@ -9,12 +9,16 @@ use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
 use embassy_time::{Duration, Instant, Ticker};
+use embedded_can::Id;
 
 // This rig uses GM6020 voltage commands for motor IDs 1 to 4.
 const MOTOR_COMMAND_ID: u16 = 0x1FF;
 // Ticks without remote input before it counts as lost.
 const REMOTE_SILENT_TICKS: u16 = 100;
 const TICK: Duration = Duration::from_millis(1);
+const YAW_FEEDBACK_ID :Option<u16>= None;
+const PITCH_FEEDBACK_ID :Option<u16>= None;
+const MOTOR_VOLTAGE_LIMIT:f32 =0.0;
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
@@ -39,29 +43,68 @@ impl Motor {
         self.command_voltage_raw = 0.0;
     }
 
-    pub fn read(&mut self, _data: &[u8; 8]) {
-        // TODO: decode angle, speed and current as the manual describes.
-        todo!("Decode motor feedback");
+    pub fn read(&mut self, data: &[u8; 8]) {
+        let angle_raw=u16::from_be_bytes([data[0],data[1]]);
+
+        self.angle_rad=angle_raw as f32 * core::f32::consts::TAU / 8192.0;
+
+        self.speed_rpm=i16::from_be_bytes([data[2],data[3]]) as f32;
+
+        self.current_raw=i16::from_be_bytes([data[4],data[5]]);
+    }
+
+    pub fn command_bytes(&self, voltage_limit: f32)-> [u8;2]{
+        let limit=voltage_limit.clamp(0.0,25000.0);
+        let limit_command=self.command_voltage_raw.clamp(-limit,limit);
+        let command=limit_command as i16;
+        command.to_be_bytes()
     }
 }
 
 /// PID gains, plus the integral and history kept between ticks.
 // TODO: add gains, history, an integral limit and a symmetric output limit `maxout`.
 #[derive(Default)]
-pub struct Pid {}
+pub struct Pid {
+    pub kp: f32,
+    pub ki: f32,
+    pub kd: f32,
+    pub integral: f32,
+    pub integral_limit: f32,
+    pub maxout: f32,
+    pub previous_error: f32,
+    pub has_previous_error: bool,
+}
 
 impl Pid {
     // TODO: clear the integral and history.
     pub fn reset(&mut self) {
-        todo!("Clear PID history");
+        self.integral=0.0;
+        self.previous_error=0.0;
+        self.has_previous_error=false;
     }
 
     /// `target` and `measured` share a unit, set by the caller. The position loop takes rad
     /// and returns rpm; the speed loop takes rpm and returns voltage counts. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
-    pub fn calculate(&mut self, _target: f32, _measured: f32, _dt_s: f32) -> f32 {
+    pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> f32 {
         // TODO: compute the PID with dt_s, and limit the integral and output.
-        todo!("Implement PID");
+        let error = target - measured;
+        self.integral+=error*dt_s;
+        self.integral=self.integral.clamp(-self.integral_limit,self.integral_limit,);
+
+        let derivative=if self.has_previous_error{
+            (error-self.previous_error)/dt_s
+        }else{0.0};
+        self.previous_error=error;
+        self.has_previous_error=true;
+
+        let p_out = self.kp * error;
+        let i_out = self.ki * self.integral;
+        let d_out = self.kd * derivative;
+
+        let output=p_out+i_out+d_out;
+        let limited_output = output.clamp(-self.maxout, self.maxout);
+        limited_output
     }
 }
 
@@ -94,6 +137,21 @@ pub struct Axis {
     pub speed_pid: Pid,
 }
 
+impl Axis{
+    pub fn calculate_output(&mut self, dt_s: f32){
+        self.target_rpm=self.position_pid.calculate(
+            self.target_angle_rad,
+            self.motor.angle_rad,
+            dt_s,
+        );
+        self.motor.command_voltage_raw=self.speed_pid.calculate(
+            self.target_rpm,
+            self.motor.speed_rpm,
+            dt_s,
+        );
+    }
+}
+
 /// State shared by every control tick.
 // TODO: add feedback ages and a fault record.
 pub struct Control {
@@ -102,6 +160,8 @@ pub struct Control {
     pub pitch: Axis,
     pub remote: Option<dm_mc02::Dr16>,
     pub remote_silent_ticks: u16,
+    pub yaw_feedback_age_ticks: u16,
+    pub pitch_feedback_age_ticks: u16,
 }
 
 /// Start in `Waiting` with no remote input.
@@ -114,8 +174,21 @@ impl Default for Control {
             pitch: Axis::default(),
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
+            yaw_feedback_age_ticks: u16::MAX,
+            pitch_feedback_age_ticks: u16::MAX,
         }
     }
+}
+
+fn fill_motor_command(data:&mut[u8;8], feedback_id:Option<u16>, command: [u8;2]){
+    let id=match feedback_id{
+        Some(id)=>id,
+        None=>return,
+    };
+    if id<0x205|| id > 0x208{return;}
+    let start=((id-0x205)*2) as usize;
+    data[start]=command[0];
+    data[start+1]=command[1];
 }
 
 impl Control {
@@ -161,13 +234,33 @@ impl Control {
 
     /// Read every queued CAN frame without waiting for more.
     pub fn read_feedback(&mut self, can: &mut Can1) {
+        self.yaw_feedback_age_ticks=self.yaw_feedback_age_ticks.saturating_add(1);
+        self.pitch_feedback_age_ticks=self.pitch_feedback_age_ticks.saturating_add(1);
         let receiver = can.reader();
         while let Ok(received) = receiver.try_receive() {
             match received {
                 Ok(envelope) => {
-                    // TODO: check the ID and length, pass the data to the matching axis's
-                    // `Motor::read`, and record its feedback age.
-                    let _frame = envelope.frame;
+                    let frame = envelope.frame;
+                    if frame.header().rtr() || frame.data().len()!=8{
+                        continue;
+                    }
+                    let feedback_id=match frame.id(){
+                        Id::Standard(id) => id.as_raw(),
+                        Id::Extended(_)=>continue,
+                    };
+                    let mut data=[0u8; 8];
+                    data.copy_from_slice(frame.data());
+                    let angle_raw=u16::from_be_bytes([data[0],data[1]]);
+                    if angle_raw>8191{continue;}
+                    if Some(feedback_id)== YAW_FEEDBACK_ID{
+                        self.yaw.motor.read(&data);
+                        self.yaw_feedback_age_ticks=0;
+                    }
+                    else if Some(feedback_id)==PITCH_FEEDBACK_ID{
+                        self.pitch.motor.read(&data);
+                        self.pitch_feedback_age_ticks=0;
+                    }
+
                 }
                 Err(error) => dm_mc02::log_can_error(error),
             }
@@ -203,7 +296,11 @@ impl Control {
     /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
     /// counts it in `TX_FAILED`.
     pub fn transmit(&mut self, can: &mut Can1) {
-        let data = [0u8; 8];
+        let mut data = [0u8; 8];
+        let yaw_command=self.yaw.motor.command_bytes(MOTOR_VOLTAGE_LIMIT);
+        let pitch_command=self.pitch.motor.command_bytes(MOTOR_VOLTAGE_LIMIT);
+        fill_motor_command(&mut data, YAW_FEEDBACK_ID, yaw_command);
+        fill_motor_command(&mut data, PITCH_FEEDBACK_ID, pitch_command);
         // TODO: clamp each voltage count output within the bench limit (protocol +/-25000),
         // encode signed i16 big-endian and write it into the
         // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
