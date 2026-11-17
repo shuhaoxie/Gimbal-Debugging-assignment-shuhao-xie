@@ -16,7 +16,7 @@ pub const PITCH_SPEED_KP: f32 = 200.0;
 pub const PITCH_SPEED_KI: f32 = 6000.0; // output counts / (rpm * second)
 pub const PITCH_I_LIMIT_RAW: f32 = 10000.0; // 积分项输出的限幅，不是积分状态限幅
 pub const PITCH_MAX_RPM: f32 = 10.0;
-pub const PITCH_ACCEL_RPM_S: f32 = 4.0;
+pub const PITCH_ACCEL_RPM_S: f32 = 9.0;
 pub const PITCH_OUTPUT_RAMP_RAW_S: f32 = 7000.0; // 输出上限每秒增加 1000，9 秒达到 9000
 
 pub const PITCH_POSITION_KI: f32 = 0.0;
@@ -86,10 +86,10 @@ pub const PITCH_MAX_TARGET_ANGLE_RAD: f32 = PITCH_REFERENCE_ANGLE_RAD + 0.18;
 
 // ===== 8. 遥控目标变化 =====
 pub const STICK_DEADZONE: f32 = 0.05;
-// 保留原来 Axis::default() 的零值，因此目前摇杆不移动目标。
+// Running 时左摇杆改变目标角度；松手保持松手时的目标，Prepare 不受摇杆影响。
 // 带符号的 rad/s；正负号决定摇杆与目标变化的对应方向。
-pub const YAW_STICK_RATE_RAD_S: f32 = 0.0;
-pub const PITCH_STICK_RATE_RAD_S: f32 = 0.0;
+pub const YAW_STICK_RATE_RAD_S: f32 = -1.0; // 满杆约 17.2 度/秒；反向时改为负值
+pub const PITCH_STICK_RATE_RAD_S: f32 = 0.45; // 满杆约 8.6 度/秒；反向时改为负值
 
 
 
