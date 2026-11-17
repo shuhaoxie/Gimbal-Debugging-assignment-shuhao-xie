@@ -3,43 +3,93 @@
 #![forbid(unsafe_code)]
 
 mod dm_mc02;
+mod params;
 
-use core::sync::atomic::{AtomicU32, Ordering};
+use core::sync::atomic::{AtomicI32, AtomicU32, Ordering};
 use dm_mc02::Can1;
 use embassy_executor::Spawner;
 use embassy_stm32::can::Frame;
-use embassy_time::{Duration, Instant, Ticker};
+use embassy_time::{Instant, Ticker};
 use embedded_can::Id;
 
-// This rig uses GM6020 voltage commands for motor IDs 1 to 4.
-const MOTOR_COMMAND_ID: u16 = 0x1FF;
-// Ticks without remote input before it counts as lost.
-const REMOTE_SILENT_TICKS: u16 = 100;
-const TICK: Duration = Duration::from_millis(1);
-const YAW_FEEDBACK_ID :Option<u16>= None;
-const PITCH_FEEDBACK_ID :Option<u16>= None;
-const MOTOR_VOLTAGE_LIMIT:f32 =0.0;
-const FEEDBACK_TIME_OUT_TICKS: u16=20;
-const PREPARE_ANGLE_TOLERANCE_RAD: f32=0.02;
-const PREPARE_SPEED_TOLERANCE_RPM: f32=2.0;
-const PREPARE_STABLE_TICKS:u32=200;
-const PREPARE_TIMEOUT_TICKS:u32=5000;
-const PREPARE_MAX_RPM: f32 = 0.0;
-const PREPARE_MAX_VOLTAGE: f32 = 0.0;
-const RUNNING_MAX_RPM: f32 = 0.0;
-const RUNNING_MAX_VOLTAGE: f32 = 0.0;
-const STALL_MIN_TARGET_RPM: f32 = 5.0;
-const STALL_MAX_ACTUAL_RPM: f32 = 1.0;
-const STALL_MIN_VOLTAGE: f32 = 1000.0;
-const STALL_DURATION_TICKS: u32 = 300;
-const OSC_MIN_SPEED_RPM: f32 = 1.0;
-const OSC_MIN_SWING_RAD: f32 = 0.02;
-const OSC_MAX_FREQUENCY_HZ: f32 = 8.0;
-const OSC_DURATION_TICKS: u32 = 500;
+// 所有调参配置统一放在 src/params/mod.rs。
+use params::*;
+#[used]
+pub static YAW_HOLDING: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static YAW_I_RAW: AtomicI32 = AtomicI32::new(0);
+
+// 1：满足到位条件；0：未满足。
+#[used]
+pub static YAW_SETTLED: AtomicU32 = AtomicU32::new(0);
+
+#[used]
+pub static PITCH_SETTLED: AtomicU32 = AtomicU32::new(0);
+
+// 0：两轴都满足；1：yaw 未满足；2：pitch 未满足；
+// 3：两轴都未满足；4：尚未检查。
+#[used]
+pub static PREPARE_BLOCKED_BY: AtomicU32 = AtomicU32::new(4);
 
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
 pub static TX_FAILED: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static PITCH_CURRENT_RAW: AtomicI32 = AtomicI32::new(0);
+// 目标角度 ×1000，单位 mrad。
+#[used]
+pub static PITCH_TARGET_POSITION_MRAD: AtomicI32 =
+    AtomicI32::new(0);
+
+// 目标速度 ×1000。
+#[used]
+pub static PITCH_TARGET_SPEED_X1000: AtomicI32 =
+    AtomicI32::new(0);
+
+#[used]
+pub static PITCH_ACTUAL_POSITION_MRAD: AtomicI32 =
+    AtomicI32::new(0);
+
+
+// 实际编码到 CAN 帧里的 pitch 指令。
+// 只能证明帧内的数据，不能证明电机已收到。
+#[used]
+pub static PITCH_FRAME_RAW: AtomicI32 = AtomicI32::new(0);
+
+// 实际角度，单位 mrad。
+#[used]
+pub static YAW_ACTUAL_POSITION_MRAD: AtomicI32 = AtomicI32::new(0);
+
+// 目标角度，单位 mrad。
+#[used]
+pub static YAW_TARGET_POSITION_MRAD: AtomicI32 = AtomicI32::new(0);
+
+// 最短方向角度误差，单位 mrad。
+#[used]
+pub static YAW_POSITION_ERROR_MRAD: AtomicI32 = AtomicI32::new(0);
+
+// 目标速度 ×1000；3000 表示 3 rpm。
+#[used]
+pub static YAW_TARGET_SPEED_X1000: AtomicI32 = AtomicI32::new(0);
+
+// 电流反馈原始值，不是安培。
+#[used]
+pub static YAW_CURRENT_RAW: AtomicI32 = AtomicI32::new(0);
+
+// 成功放入 CAN 发送队列的帧数。
+#[used]
+pub static TX_QUEUED: AtomicU32 = AtomicU32::new(0);
+// 故障恢复当前被哪个条件挡住。
+#[used]
+pub static RECOVERY_CHECK: AtomicU32 = AtomicU32::new(0);
+/// Integral contribution in motor command counts (not volts).
+#[used]
+pub static PITCH_I_RAW: AtomicI32 = AtomicI32::new(0);
+// Latched stop reason: 0 none, 1 recenter timeout, 2 yaw stall, 3 pitch stall,
+// 4 yaw oscillation, 5 pitch oscillation. Cleared only on a new accepted start/recovery.
+#[used]
+pub static FAULT_REASON: AtomicU32 = AtomicU32::new(0);
+
 
 /// Feedback and voltage command for one motor.
 #[derive(Default)]
@@ -86,6 +136,7 @@ pub struct Pid {
     pub ki: f32,
     pub kd: f32,
     pub integral: f32,
+    /// Maximum absolute I contribution in output units.
     pub integral_limit: f32,
     pub maxout: f32,
     pub previous_error: f32,
@@ -104,24 +155,44 @@ impl Pid {
     /// and returns rpm; the speed loop takes rpm and returns voltage counts. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> f32 {
-        // TODO: compute the PID with dt_s, and limit the integral and output.
+        if !target.is_finite() || !measured.is_finite()
+            || !dt_s.is_finite() || dt_s <= 0.0
+            || !self.kp.is_finite() || !self.ki.is_finite() || !self.kd.is_finite()
+            || !self.maxout.is_finite() || self.maxout <= 0.0
+            || !self.integral_limit.is_finite() || self.integral_limit < 0.0
+        {
+            self.reset();
+            return 0.0;
+        }
         let error = target - measured;
-        self.integral+=error*dt_s;
-        self.integral=self.integral.clamp(-self.integral_limit,self.integral_limit,);
+        let derivative = if self.has_previous_error {
+            (error - self.previous_error) / dt_s
+        } else { 0.0 };
+        self.previous_error = error;
+        self.has_previous_error = true;
+        let pd = self.kp * error + self.kd * derivative;
+        if !pd.is_finite() {
+            self.reset();
+            return 0.0;
+        }
 
-        let derivative=if self.has_previous_error{
-            (error-self.previous_error)/dt_s
-        }else{0.0};
-        self.previous_error=error;
-        self.has_previous_error=true;
-
-        let p_out = self.kp * error;
-        let i_out = self.ki * self.integral;
-        let d_out = self.kd * derivative;
-
-        let output=p_out+i_out+d_out;
-        let limited_output = output.clamp(-self.maxout, self.maxout);
-        limited_output
+        if self.ki == 0.0 || self.integral_limit == 0.0 {
+            self.integral = 0.0;
+        } else {
+            // Store error-seconds internally, but configure the I limit in output units.
+            let state_limit = self.integral_limit.min(self.maxout) / self.ki.abs();
+            self.integral = self.integral.clamp(-state_limit, state_limit);
+            let candidate = (self.integral + error * dt_s)
+                .clamp(-state_limit, state_limit);
+            let candidate_output = pd + self.ki * candidate;
+            let pushes_further = (candidate_output > self.maxout && self.ki * error > 0.0)
+                || (candidate_output < -self.maxout && self.ki * error < 0.0);
+            // Do not integrate further into saturation; always allow unwinding.
+            if !pushes_further {
+                self.integral = candidate;
+            }
+        }
+        (pd + self.ki * self.integral).clamp(-self.maxout, self.maxout)
     }
 }
 
@@ -148,6 +219,8 @@ pub struct Axis {
     pub target_angle_rad: f32,
     /// Speed loop target in rpm, set from the position loop output.
     pub target_rpm: f32,
+    /// Startup output ceiling for the profiled pitch controller.
+    pub output_limit_raw: f32,
     /// Position loop: rad in, rpm out.
     pub position_pid: Pid,
     /// Speed loop: rpm in, voltage counts out.
@@ -167,17 +240,36 @@ pub struct Axis {
 }
 
 impl Axis{
-    pub fn calculate_output(&mut self, dt_s: f32){
-        self.target_rpm=self.position_pid.calculate(
+    pub fn calculate_output(&mut self, dt_s: f32) {
+        self.target_rpm = self.position_pid.calculate(
             self.target_angle_rad,
             self.motor.angle_rad,
             dt_s,
         );
-        self.motor.command_voltage_raw=self.speed_pid.calculate(
+        self.motor.command_voltage_raw = self.speed_pid.calculate(
             self.target_rpm,
             self.motor.speed_rpm,
             dt_s,
         );
+    }
+
+    /// Cascaded position P -> ramped speed target -> speed PI.
+    /// Only the available ceiling ramps; feedback can reduce/reverse output immediately.
+    pub fn calculate_pitch_output(&mut self, dt_s: f32, configured_limit: f32) {
+        if !dt_s.is_finite() || dt_s <= 0.0 || !configured_limit.is_finite() || configured_limit < 0.0 {
+            self.speed_pid.reset();
+            self.motor.disable();
+            self.target_rpm = 0.0;
+            self.output_limit_raw = 0.0;
+            return;
+        }
+        let desired_rpm = self.position_pid.calculate(self.target_angle_rad, self.motor.angle_rad, dt_s);
+        let max_change = PITCH_ACCEL_RPM_S * dt_s;
+        self.target_rpm += (desired_rpm - self.target_rpm).clamp(-max_change, max_change);
+        self.output_limit_raw = (self.output_limit_raw + PITCH_OUTPUT_RAMP_RAW_S * dt_s)
+            .min(configured_limit).min(MOTOR_VOLTAGE_LIMIT);
+        self.speed_pid.maxout = self.output_limit_raw;
+        self.motor.command_voltage_raw = self.speed_pid.calculate(self.target_rpm, self.motor.speed_rpm, dt_s);
     }
 
     pub fn update_target_from_stick(&mut self, input: f32, dt_s: f32) -> bool {
@@ -229,6 +321,28 @@ impl Axis{
             && (min_angle..=max_angle).contains(&self.motor.angle_rad)
     }
 
+    /// A separate start envelope allows recentering from the measured rest pose.
+    /// Running target limits remain unchanged; the reference must lie inside them.
+    pub fn can_recenter_from(&self, start_min: f32) -> bool {
+        let (Some(min), Some(max), Some(reference)) = (
+            self.min_target_angle_rad,
+            self.max_target_angle_rad,
+            self.reference_angle_rad,
+        ) else {
+            return false;
+        };
+        start_min.is_finite()
+            && min.is_finite()
+            && max.is_finite()
+            && reference.is_finite()
+            && self.motor.angle_rad.is_finite()
+            && self.stick_rate_rad_s.is_finite()
+            && start_min <= min
+            && min < max
+            && (min..=max).contains(&reference)
+            && (start_min..=max).contains(&self.motor.angle_rad)
+    }
+
     pub fn is_stall_candidate(
         &self,
         min_target_rpm: f32,
@@ -264,6 +378,7 @@ impl Axis{
 
     pub fn reset_control(&mut self){
         self.target_rpm=0.0;
+        self.output_limit_raw=0.0;
         self.position_pid.reset();
         self.speed_pid.reset();
         self.motor.disable();
@@ -407,8 +522,48 @@ impl Default for Control {
     fn default() -> Self {
         Self {
             state: State::Waiting,
-            yaw: Axis::default(),
-            pitch: Axis::default(),
+            yaw: Axis {
+                position_pid: Pid {
+                    kp: YAW_POSITION_KP,
+                    ki: YAW_POSITION_KI,
+                    kd: YAW_POSITION_KD,
+                    integral_limit: YAW_POSITION_I_LIMIT_RPM,
+                    ..Pid::default()
+                },
+                speed_pid: Pid {
+                    kp: YAW_SPEED_KP,
+                    ki: YAW_SPEED_KI,
+                    kd: YAW_SPEED_KD,
+                    integral_limit: YAW_SPEED_I_LIMIT_RAW,
+                    ..Pid::default()
+                },
+                reference_angle_rad: Some(YAW_REFERENCE_ANGLE_RAD),
+                min_target_angle_rad: Some(YAW_MIN_TARGET_ANGLE_RAD),
+                max_target_angle_rad: Some(YAW_MAX_TARGET_ANGLE_RAD),
+                stick_rate_rad_s: YAW_STICK_RATE_RAD_S,
+                ..Axis::default()
+            },
+            pitch: Axis {
+                position_pid: Pid {
+                    kp: PITCH_POSITION_KP,
+                    ki: PITCH_POSITION_KI,
+                    kd: PITCH_POSITION_KD,
+                    integral_limit: PITCH_POSITION_I_LIMIT_RPM,
+                    ..Pid::default()
+                },
+                speed_pid: Pid {
+                    kp: PITCH_SPEED_KP,
+                    ki: PITCH_SPEED_KI,
+                    kd: PITCH_SPEED_KD,
+                    integral_limit: PITCH_I_LIMIT_RAW,
+                    ..Pid::default()
+                },
+                reference_angle_rad: Some(PITCH_REFERENCE_ANGLE_RAD),
+                min_target_angle_rad: Some(PITCH_MIN_TARGET_ANGLE_RAD),
+                max_target_angle_rad: Some(PITCH_MAX_TARGET_ANGLE_RAD),
+                stick_rate_rad_s: PITCH_STICK_RATE_RAD_S,
+                ..Axis::default()
+            },
             remote: None,
             remote_silent_ticks: REMOTE_SILENT_TICKS,
             yaw_feedback_age_ticks: u16::MAX,
@@ -449,7 +604,7 @@ fn shortest_angle_error(target:f32, actual:f32) ->f32{
 fn normalize_stick(raw: i16) -> f32 {
     let input = (raw as f32 / 660.0).clamp(-1.0, 1.0);
 
-    if input.abs() < 0.05 {
+    if input.abs() < STICK_DEADZONE {
         0.0
     } else {
         input
@@ -461,6 +616,12 @@ impl Control {
     pub fn disable_all(&mut self) {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
+        for axis in [&mut self.yaw, &mut self.pitch] {
+            axis.target_rpm = 0.0;
+            axis.output_limit_raw = 0.0;
+            axis.position_pid.reset();
+            axis.speed_pid.reset();
+        }
     }
 
     pub fn check_stalls(&mut self) {
@@ -475,6 +636,7 @@ impl Control {
             self.disable_all();
             self.state = State::Error;
     
+            FAULT_REASON.store(if pitch_stalled { 3 } else { 2 }, Ordering::Relaxed);
             if yaw_stalled {
                 rtt_target::rprintln!("Fault: yaw suspected stall");
             }
@@ -497,6 +659,7 @@ impl Control {
             self.disable_all();
             self.state = State::Error;
     
+            FAULT_REASON.store(if pitch_fault { 5 } else { 4 }, Ordering::Relaxed);
             if yaw_fault {
                 rtt_target::rprintln!(
                     "Fault: yaw oscillation {:.1} Hz",
@@ -511,6 +674,10 @@ impl Control {
                 );
             }
         }
+    }
+
+    fn pitch_can_recenter(&self) -> bool {
+        self.pitch.can_recenter_from(PITCH_REST_ANGLE_RAD - PITCH_REST_TOLERANCE_RAD)
     }
 
     pub fn feedback_is_fresh(&self)->bool{
@@ -570,6 +737,10 @@ impl Control {
     pub fn tick(&mut self, can: &mut Can1) {
         self.read_remote();
         self.read_feedback(can);
+        dm_mc02::publish_feedback_watch(
+            self.yaw_feedback_age_ticks,
+            self.pitch_feedback_age_ticks,
+        );
         self.update_mode();
         if self.remote.is_none() && self.state != State::Error {
             self.state = State::Waiting;
@@ -578,6 +749,7 @@ impl Control {
         self.check_stalls();
         self.check_oscillations();
         self.transmit(can);
+        self.publish_motor_watch();
     }
 
     /// Take the latest input published by the remote task. After an invalid frame, or
@@ -593,6 +765,7 @@ impl Control {
         if self.remote_silent_ticks >= REMOTE_SILENT_TICKS {
             self.remote = None;
         }
+        dm_mc02::publish_remote_watch(self.remote, self.remote_silent_ticks);
         if self.remote.is_none() {
             self.disable_all();
             if self.state != State::Error {
@@ -623,6 +796,11 @@ impl Control {
                     if angle_raw>8191{continue;}
                     if Some(feedback_id)== YAW_FEEDBACK_ID{
                         self.yaw.motor.read(&data);
+                        if let Some(reference) = self.yaw.reference_angle_rad {
+                            let raw_angle = self.yaw.motor.angle_rad;
+                            self.yaw.motor.angle_rad =
+                                reference + shortest_angle_error(raw_angle, reference);
+                        }
                         self.yaw_feedback_age_ticks=0;
                     }
                     else if Some(feedback_id)==PITCH_FEEDBACK_ID{
@@ -661,6 +839,7 @@ impl Control {
                     && self.pitch.reference_angle_rad.is_some();
 
                 if enable_request && self.feedback_is_fresh() && reference_ready{
+                    FAULT_REASON.store(0, Ordering::Relaxed);
                     self.yaw.reset_control();
                     self.pitch.reset_control();
 
@@ -685,7 +864,19 @@ impl Control {
                     PREPARE_ANGLE_TOLERANCE_RAD,
                     PREPARE_SPEED_TOLERANCE_RPM,
                 );
-                if yaw_settled && pitch_settled{
+
+                YAW_SETTLED.store(u32::from(yaw_settled), Ordering::Relaxed);
+                PITCH_SETTLED.store(u32::from(pitch_settled), Ordering::Relaxed);
+
+                let blocked_by = match (yaw_settled, pitch_settled) {
+                    (true, true) => 0,
+                    (false, true) => 1,
+                    (true, false) => 2,
+                    (false, false) => 3,
+                };
+
+                PREPARE_BLOCKED_BY.store(blocked_by, Ordering::Relaxed);
+                if yaw_settled && pitch_settled {
                     self.prepare_stable_ticks=
                         self.prepare_stable_ticks.saturating_add(1);
                 }
@@ -696,6 +887,7 @@ impl Control {
                 if self.prepare_ticks>=PREPARE_TIMEOUT_TICKS{
                     self.disable_all();
                     self.state=State::Error;
+                    FAULT_REASON.store(1, Ordering::Relaxed);
                     rtt_target::rprintln!("Prepare timeout");
                 }
                 else if self.prepare_stable_ticks>=PREPARE_STABLE_TICKS{
@@ -710,27 +902,31 @@ impl Control {
                 if recovery_request {
                     let yaw_allowed = self.yaw.current_position_is_allowed();
                     let pitch_allowed = self.pitch.current_position_is_allowed();
-            
-                    if yaw_allowed && pitch_allowed {
+                    let pitch_recenter_allowed = self.pitch_can_recenter();
+
+                    if yaw_allowed && (pitch_allowed || pitch_recenter_allowed) {
+                        FAULT_REASON.store(0, Ordering::Relaxed);
                         self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
-                        self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
-            
                         self.yaw.reset_control();
                         self.pitch.reset_control();
-            
                         self.prepare_ticks = 0;
                         self.prepare_stable_ticks = 0;
-            
-                        self.state = State::Running;
-            
-                        rtt_target::rprintln!(
-                            "Recovered: yaw target={:.3}, pitch target={:.3}; histories reset",
-                            self.yaw.target_angle_rad,
-                            self.pitch.target_angle_rad,
-                        );
+
+                        if pitch_allowed {
+                            // Preserve recovery at the current pose inside running limits.
+                            self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+                            self.state = State::Running;
+                            rtt_target::rprintln!("Recovered at current pose");
+                        } else if let Some(reference) = self.pitch.reference_angle_rad {
+                            // At the verified lower rest pose: recenter before Running.
+                            self.pitch.target_angle_rad = reference;
+                            self.state = State::Prepare;
+                            rtt_target::rprintln!("Recovered: pitch recentering from rest");
+                        }
                     } else {
                         rtt_target::rprintln!(
-                            "Recovery refused: check angle limits and current positions"
+                            "Recovery refused: yaw_allowed={}, pitch_allowed={}, pitch_recenter_allowed={}",
+                            yaw_allowed, pitch_allowed, pitch_recenter_allowed,
                         );
                     }
                 }
@@ -749,21 +945,21 @@ impl Control {
     
             State::Prepare => {
                 self.yaw.position_pid.maxout = PREPARE_MAX_RPM;
-                self.pitch.position_pid.maxout = PREPARE_MAX_RPM;
+                self.pitch.position_pid.maxout = PITCH_MAX_RPM;
     
-                self.yaw.speed_pid.maxout = PREPARE_MAX_VOLTAGE;
-                self.pitch.speed_pid.maxout = PREPARE_MAX_VOLTAGE;
+                self.yaw.speed_pid.maxout = YAW_SPEED_MAXOUT_RAW;
+
     
                 self.yaw.calculate_output(0.001);
-                self.pitch.calculate_output(0.001);
+                self.pitch.calculate_pitch_output(0.001, PREPARE_MAX_VOLTAGE);
             }
     
             State::Running => {
                 self.yaw.position_pid.maxout = RUNNING_MAX_RPM;
-                self.pitch.position_pid.maxout = RUNNING_MAX_RPM;
+                self.pitch.position_pid.maxout = PITCH_MAX_RPM;
     
-                self.yaw.speed_pid.maxout = RUNNING_MAX_VOLTAGE;
-                self.pitch.speed_pid.maxout = RUNNING_MAX_VOLTAGE;
+                self.yaw.speed_pid.maxout = YAW_SPEED_MAXOUT_RAW;
+
 
                 let remote = match self.remote {
                     Some(remote) => remote,
@@ -787,7 +983,7 @@ impl Control {
                 }
     
                 self.yaw.calculate_output(0.001);
-                self.pitch.calculate_output(0.001);
+                self.pitch.calculate_pitch_output(0.001, RUNNING_MAX_VOLTAGE);
             }
     
             State::Error => {
@@ -797,6 +993,114 @@ impl Control {
     }
 
 
+
+    fn publish_motor_watch(&self) {
+        YAW_HOLDING.store(
+            0,
+            Ordering::Relaxed,
+        );
+        YAW_I_RAW.store(
+            (self.yaw.speed_pid.ki * self.yaw.speed_pid.integral) as i32,
+            Ordering::Relaxed,
+        );
+        YAW_SETTLED.store(
+            u32::from(self.yaw.is_settled(
+                PREPARE_ANGLE_TOLERANCE_RAD,
+                PREPARE_SPEED_TOLERANCE_RPM,
+            )),
+            Ordering::Relaxed,
+        );
+        PITCH_SETTLED.store(
+            u32::from(self.pitch.is_settled(
+                PREPARE_ANGLE_TOLERANCE_RAD,
+                PREPARE_SPEED_TOLERANCE_RPM,
+            )),
+            Ordering::Relaxed,
+        );
+        YAW_ACTUAL_POSITION_MRAD.store(
+            (self.yaw.motor.angle_rad * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        
+        YAW_TARGET_POSITION_MRAD.store(
+            (self.yaw.target_angle_rad * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        
+        YAW_POSITION_ERROR_MRAD.store(
+            (shortest_angle_error(
+                self.yaw.target_angle_rad,
+                self.yaw.motor.angle_rad,
+            ) * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        
+        YAW_TARGET_SPEED_X1000.store(
+            (self.yaw.target_rpm * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        
+        YAW_CURRENT_RAW.store(
+            i32::from(self.yaw.motor.current_raw),
+            Ordering::Relaxed,
+        );
+        PITCH_ACTUAL_POSITION_MRAD.store(
+            (self.pitch.motor.angle_rad * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        PITCH_TARGET_POSITION_MRAD.store(
+            (self.pitch.target_angle_rad * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        
+        PITCH_TARGET_SPEED_X1000.store(
+            (self.pitch.target_rpm * 1000.0) as i32,
+            Ordering::Relaxed,
+        );
+        PITCH_CURRENT_RAW.store(
+            i32::from(self.pitch.motor.current_raw),
+            Ordering::Relaxed,
+        );
+        PITCH_I_RAW.store((self.pitch.speed_pid.ki * self.pitch.speed_pid.integral) as i32, Ordering::Relaxed);
+        let state = match self.state {
+            State::Waiting => 0,
+            State::Prepare => 1,
+            State::Running => 2,
+            State::Error => 3,
+        };
+        dm_mc02::publish_motor_watch(
+            state,
+            self.yaw.motor.speed_rpm as i32,
+            self.pitch.motor.speed_rpm as i32,
+            i32::from(i16::from_be_bytes(self.yaw.motor.command_bytes(MOTOR_VOLTAGE_LIMIT))),
+            i32::from(i16::from_be_bytes(self.pitch.motor.command_bytes(MOTOR_VOLTAGE_LIMIT))),
+        );
+        let check = if self.state != State::Error {
+            0
+        } else if let Some(remote) = self.remote {
+            if remote.right_switch != 3 {
+                2
+            } else if !self.feedback_is_fresh() {
+                3
+            } else if normalize_stick(remote.channels[2]) != 0.0
+                || normalize_stick(remote.channels[3]) != 0.0
+            {
+                4
+            } else if !self.yaw.current_position_is_allowed() {
+                5
+            } else if !self.pitch.current_position_is_allowed() && !self.pitch_can_recenter() {
+                6
+            } else if !self.recovery_armed {
+                7
+            } else {
+                8
+            }
+        } else {
+            1
+        };
+        
+        RECOVERY_CHECK.store(check, Ordering::Relaxed);
+    }
 
     /// Queue one group command frame on CAN1 without waiting. This runs every tick, so a
     /// cleared command reaches the motor within 1 ms. A full queue drops the frame and
@@ -810,9 +1114,17 @@ impl Control {
         // TODO: clamp each voltage count output within the bench limit (protocol +/-25000),
         // encode signed i16 big-endian and write it into the
         // bytes for its motor ID as the manual describes. Other motor IDs stay zero.
+        // 当前 pitch 反馈 ID 是 0x206，对应指令帧第 2、3 字节。
+        // 如果以后更改电机 ID，这里的槽位也要对应修改。
+        let pitch_in_frame = i16::from_be_bytes([data[2], data[3]]);
+        PITCH_FRAME_RAW.store(i32::from(pitch_in_frame), Ordering::Relaxed);
+
         let frame = Frame::new_standard(MOTOR_COMMAND_ID, &data).unwrap();
+
         if can.writer().try_write(frame).is_err() {
             TX_FAILED.fetch_add(1, Ordering::Relaxed);
+        } else {
+            TX_QUEUED.fetch_add(1, Ordering::Relaxed);
         }
     }
 }

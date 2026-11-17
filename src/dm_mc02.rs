@@ -5,7 +5,7 @@
 use core::fmt::Write as _;
 use core::num::{NonZeroU8, NonZeroU16};
 use core::panic::PanicInfo;
-use core::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicI32, AtomicU32, Ordering};
 use embassy_stm32::can::config::NominalBitTiming;
 use embassy_stm32::can::enums::BusError;
 use embassy_stm32::can::{self, BufferedCan, CanConfigurator, RxBuf, TxBuf};
@@ -29,6 +29,76 @@ use static_cell::StaticCell;
 
 pub type RemoteRx = UartRx<'static, Async>;
 pub static REMOTE: Signal<CriticalSectionRawMutex, Option<Dr16>> = Signal::new();
+
+// Flat debug mirrors avoid Option/async-local expansion in Tuning Studio.
+// Only control_task writes these; each scalar can be sampled independently by SWD.
+// Multiple fields are not an atomic snapshot of a single control tick.
+#[used]
+pub static RC_CH0: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static RC_CH1: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static RC_CH2: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static RC_CH3: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static RC_CH4: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static RC_RIGHT_SWITCH: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static RC_LEFT_SWITCH: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static RC_VALID: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static RC_SILENT_TICKS: AtomicU32 = AtomicU32::new(100);
+
+/// Control ticks since the last accepted motor feedback; 65535 means saturated.
+#[used]
+pub static YAW_FEEDBACK_AGE_TICKS: AtomicU32 = AtomicU32::new(u16::MAX as u32);
+#[used]
+pub static PITCH_FEEDBACK_AGE_TICKS: AtomicU32 = AtomicU32::new(u16::MAX as u32);
+
+pub fn publish_feedback_watch(yaw_age: u16, pitch_age: u16) {
+    YAW_FEEDBACK_AGE_TICKS.store(u32::from(yaw_age), Ordering::Relaxed);
+    PITCH_FEEDBACK_AGE_TICKS.store(u32::from(pitch_age), Ordering::Relaxed);
+}
+
+
+/// Mirror the input actually held by Control, including invalid/timeout clearing.
+pub fn publish_remote_watch(remote: Option<Dr16>, silent_ticks: u16) {
+    let channels = remote.map_or([0; 5], |r| r.channels);
+    RC_CH0.store(i32::from(channels[0]), Ordering::Relaxed);
+    RC_CH1.store(i32::from(channels[1]), Ordering::Relaxed);
+    RC_CH2.store(i32::from(channels[2]), Ordering::Relaxed);
+    RC_CH3.store(i32::from(channels[3]), Ordering::Relaxed);
+    RC_CH4.store(i32::from(channels[4]), Ordering::Relaxed);
+    RC_RIGHT_SWITCH.store(remote.map_or(0, |r| u32::from(r.right_switch)), Ordering::Relaxed);
+    RC_LEFT_SWITCH.store(remote.map_or(0, |r| u32::from(r.left_switch)), Ordering::Relaxed);
+    RC_SILENT_TICKS.store(u32::from(silent_ticks), Ordering::Relaxed);
+    RC_VALID.store(u32::from(remote.is_some()), Ordering::Relaxed);
+}
+
+
+// Powered-test diagnostics: sampled individually, not a coherent multi-field snapshot.
+// State: 0 Waiting, 1 Prepare, 2 Running, 3 Error.
+#[used]
+pub static CONTROL_STATE: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static YAW_SPEED_RPM: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static PITCH_SPEED_RPM: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static YAW_COMMAND_RAW: AtomicI32 = AtomicI32::new(0);
+#[used]
+pub static PITCH_COMMAND_RAW: AtomicI32 = AtomicI32::new(0);
+
+pub fn publish_motor_watch(state: u32, yaw_speed: i32, pitch_speed: i32, yaw_command: i32, pitch_command: i32) {
+    YAW_SPEED_RPM.store(yaw_speed, Ordering::Relaxed);
+    PITCH_SPEED_RPM.store(pitch_speed, Ordering::Relaxed);
+    YAW_COMMAND_RAW.store(yaw_command, Ordering::Relaxed);
+    PITCH_COMMAND_RAW.store(pitch_command, Ordering::Relaxed);
+    CONTROL_STATE.store(state, Ordering::Relaxed);
+}
 
 pub type Can1 = BufferedCan<'static, 4, 16>;
 static CAN_TX: StaticCell<TxBuf<4>> = StaticCell::new();

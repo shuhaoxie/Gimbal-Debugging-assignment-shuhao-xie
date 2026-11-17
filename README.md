@@ -223,16 +223,20 @@ if let Some(remote) = self.remote {
 模板现在只有接口，没有成员和计算内容：
 
 ```rust
-pub struct Pid {}
+#[derive(Default)];
+pub struct Pid {
+    pub kp: f32;
+    pub max_out; f32;
+}
 
 impl Pid {
     pub fn reset(&mut self) { todo!("清理 PID 历史"); }
-    pub fn calculate(
-        &mut self,
-        _target: f32,
-        _measured: f32,
-        _dt_s: f32,
-    ) -> f32 { todo!("实现 PID 运算"); }
+    pub fn calculate(&mut self,_target: f32,_measured: f32,_dt_s: f32,) -> f32 { 
+        let error=target-measured;
+        let output=self.kp*error;
+        let limited_output=output.clamp(-self.maxout, self.maxout);
+        limited output;
+    }
 }
 ```
 
