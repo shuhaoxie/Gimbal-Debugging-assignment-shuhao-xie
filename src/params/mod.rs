@@ -12,8 +12,8 @@ use embassy_time::Duration;
 
 // ===== Pitch（抬头/低头）：目前实际启用的轴 =====
 pub const PITCH_POSITION_KP: f32 = 15.0; // rpm/rad
-pub const PITCH_SPEED_KP: f32 = 180.0;
-pub const PITCH_SPEED_KI: f32 = 4500.0; // output counts / (rpm * second)
+pub const PITCH_SPEED_KP: f32 = 200.0;
+pub const PITCH_SPEED_KI: f32 = 6000.0; // output counts / (rpm * second)
 pub const PITCH_I_LIMIT_RAW: f32 = 10000.0; // 积分项输出的限幅，不是积分状态限幅
 pub const PITCH_MAX_RPM: f32 = 10.0;
 pub const PITCH_ACCEL_RPM_S: f32 = 4.0;
@@ -29,7 +29,7 @@ pub const YAW_POSITION_KP: f32 = 85.0;
 pub const YAW_POSITION_KI: f32 = 0.0;
 pub const YAW_POSITION_KD: f32 = 0.0;
 pub const YAW_POSITION_I_LIMIT_RPM: f32 = 0.0;
-pub const YAW_SPEED_KP: f32 = 300.0;
+pub const YAW_SPEED_KP: f32 = 320.0;
 pub const YAW_SPEED_KI: f32 = 0.0;
 pub const YAW_SPEED_KD: f32 = 0.0;
 pub const YAW_SPEED_I_LIMIT_RAW: f32 = 0.0;
@@ -92,3 +92,12 @@ pub const YAW_STICK_RATE_RAD_S: f32 = 0.0;
 pub const PITCH_STICK_RATE_RAD_S: f32 = 0.0;
 
 
+
+// ===== 9. Pitch 到位积分死区（只影响 Pitch；角度单位 rad） =====
+// 连续 200 ms 位于进入范围且足够慢，才冻结积分；已有积分支撑输出保留。
+// 退出范围稍大，避免在边界反复切换；目标角度改变也会退出。
+pub const PITCH_HOLD_ENTER_RAD: f32 = 0.015; // 15 mrad，约 0.86 度
+pub const PITCH_HOLD_EXIT_RAD: f32 = 0.020; // 20 mrad，约 1.15 度
+pub const PITCH_HOLD_ENTER_RPM: f32 = 1.0;
+pub const PITCH_HOLD_EXIT_RPM: f32 = 2.0;
+pub const PITCH_HOLD_STABLE_TICKS: u32 = 200;

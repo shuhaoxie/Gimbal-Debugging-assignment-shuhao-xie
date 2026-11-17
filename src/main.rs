@@ -16,6 +16,9 @@ use embedded_can::Id;
 use params::*;
 #[used]
 pub static YAW_HOLDING: AtomicU32 = AtomicU32::new(0);
+// 1: pitch deadzone hold active; existing gravity-support integral is retained.
+#[used]
+pub static PITCH_HOLDING: AtomicU32 = AtomicU32::new(0);
 #[used]
 pub static YAW_I_RAW: AtomicI32 = AtomicI32::new(0);
 
@@ -155,6 +158,11 @@ impl Pid {
     /// and returns rpm; the speed loop takes rpm and returns voltage counts. `dt_s` is in seconds.
     /// If a position loop returns rad/s, convert it to rpm before passing it to the speed loop.
     pub fn calculate(&mut self, target: f32, measured: f32, dt_s: f32) -> f32 {
+        self.calculate_with_integral(target, measured, dt_s, true)
+    }
+
+    /// Freeze only integration; P, D, validation and output limits remain active.
+    pub fn calculate_with_integral(&mut self, target: f32, measured: f32, dt_s: f32, integrate: bool) -> f32 {
         if !target.is_finite() || !measured.is_finite()
             || !dt_s.is_finite() || dt_s <= 0.0
             || !self.kp.is_finite() || !self.ki.is_finite() || !self.kd.is_finite()
@@ -188,7 +196,7 @@ impl Pid {
             let pushes_further = (candidate_output > self.maxout && self.ki * error > 0.0)
                 || (candidate_output < -self.maxout && self.ki * error < 0.0);
             // Do not integrate further into saturation; always allow unwinding.
-            if !pushes_further {
+            if integrate && !pushes_further {
                 self.integral = candidate;
             }
         }
@@ -221,6 +229,9 @@ pub struct Axis {
     pub target_rpm: f32,
     /// Startup output ceiling for the profiled pitch controller.
     pub output_limit_raw: f32,
+    pub pitch_holding: bool,
+    pub pitch_hold_ticks: u32,
+    pub pitch_hold_target_rad: f32,
     /// Position loop: rad in, rpm out.
     pub position_pid: Pid,
     /// Speed loop: rpm in, voltage counts out.
@@ -261,15 +272,47 @@ impl Axis{
             self.motor.disable();
             self.target_rpm = 0.0;
             self.output_limit_raw = 0.0;
+            self.pitch_holding = false;
+            self.pitch_hold_ticks = 0;
             return;
         }
-        let desired_rpm = self.position_pid.calculate(self.target_angle_rad, self.motor.angle_rad, dt_s);
+        let target_changed = (self.target_angle_rad - self.pitch_hold_target_rad).abs() > 1e-6;
+        if target_changed || !self.target_angle_rad.is_finite() || !self.motor.angle_rad.is_finite()
+            || !self.motor.speed_rpm.is_finite()
+        {
+            self.pitch_holding = false;
+            self.pitch_hold_ticks = 0;
+            self.pitch_hold_target_rad = self.target_angle_rad;
+        }
+        let angle_error = (self.target_angle_rad - self.motor.angle_rad).abs();
+        let speed = self.motor.speed_rpm.abs();
+        if self.pitch_holding {
+            if angle_error >= PITCH_HOLD_EXIT_RAD || speed >= PITCH_HOLD_EXIT_RPM {
+                self.pitch_holding = false;
+                self.pitch_hold_ticks = 0;
+            }
+        } else if angle_error < PITCH_HOLD_ENTER_RAD && speed < PITCH_HOLD_ENTER_RPM {
+            self.pitch_hold_ticks = self.pitch_hold_ticks.saturating_add(1);
+            self.pitch_holding = self.pitch_hold_ticks >= PITCH_HOLD_STABLE_TICKS;
+        } else {
+            self.pitch_hold_ticks = 0;
+        }
+        // Continue updating position PID history even while its request is suppressed.
+        let desired_rpm = self.position_pid.calculate_with_integral(
+            self.target_angle_rad, self.motor.angle_rad, dt_s, !self.pitch_holding,
+        );
         let max_change = PITCH_ACCEL_RPM_S * dt_s;
-        self.target_rpm += (desired_rpm - self.target_rpm).clamp(-max_change, max_change);
+        if self.pitch_holding {
+            self.target_rpm = 0.0;
+        } else {
+            self.target_rpm += (desired_rpm - self.target_rpm).clamp(-max_change, max_change);
+        }
         self.output_limit_raw = (self.output_limit_raw + PITCH_OUTPUT_RAMP_RAW_S * dt_s)
             .min(configured_limit).min(MOTOR_VOLTAGE_LIMIT);
         self.speed_pid.maxout = self.output_limit_raw;
-        self.motor.command_voltage_raw = self.speed_pid.calculate(self.target_rpm, self.motor.speed_rpm, dt_s);
+        self.motor.command_voltage_raw = self.speed_pid.calculate_with_integral(
+            self.target_rpm, self.motor.speed_rpm, dt_s, !self.pitch_holding,
+        );
     }
 
     pub fn update_target_from_stick(&mut self, input: f32, dt_s: f32) -> bool {
@@ -377,6 +420,9 @@ impl Axis{
     }
 
     pub fn reset_control(&mut self){
+        self.pitch_holding = false;
+        self.pitch_hold_ticks = 0;
+        self.pitch_hold_target_rad = self.target_angle_rad;
         self.target_rpm=0.0;
         self.output_limit_raw=0.0;
         self.position_pid.reset();
@@ -617,6 +663,9 @@ impl Control {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
         for axis in [&mut self.yaw, &mut self.pitch] {
+            axis.pitch_holding = false;
+            axis.pitch_hold_ticks = 0;
+            axis.pitch_hold_target_rad = axis.target_angle_rad;
             axis.target_rpm = 0.0;
             axis.output_limit_raw = 0.0;
             axis.position_pid.reset();
@@ -995,6 +1044,7 @@ impl Control {
 
 
     fn publish_motor_watch(&self) {
+        PITCH_HOLDING.store(u32::from(self.pitch.pitch_holding), Ordering::Relaxed);
         YAW_HOLDING.store(
             0,
             Ordering::Relaxed,
