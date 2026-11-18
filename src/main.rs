@@ -34,6 +34,23 @@ pub static PITCH_SETTLED: AtomicU32 = AtomicU32::new(0);
 #[used]
 pub static PREPARE_BLOCKED_BY: AtomicU32 = AtomicU32::new(4);
 
+// Flat test diagnostics: tick counters are nominal ms at the 1 kHz control rate.
+// Frequency is Hz * 1000. Scalars are sampled independently, not a coherent snapshot.
+#[used]
+pub static PREPARE_STABLE_MS: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static YAW_STALL_MS: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static PITCH_STALL_MS: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static YAW_OSC_FREQ_X1000: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static PITCH_OSC_FREQ_X1000: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static YAW_OSC_FAST_MS: AtomicU32 = AtomicU32::new(0);
+#[used]
+pub static PITCH_OSC_FAST_MS: AtomicU32 = AtomicU32::new(0);
+
 /// Command frames dropped because the CAN transmit queue was full, for example while no
 /// motor acknowledges frames.
 pub static TX_FAILED: AtomicU32 = AtomicU32::new(0);
@@ -97,7 +114,7 @@ pub static FAULT_REASON: AtomicU32 = AtomicU32::new(0);
 /// Feedback and voltage command for one motor.
 #[derive(Default)]
 pub struct Motor {
-    /// Single-turn motor shaft angle in rad; turns are not counted.
+    /// Shaft angle in rad; continuous yaw is unwrapped by Axis after reading feedback.
     pub angle_rad: f32,
     pub speed_rpm: f32,
     /// Feedback current as sent on the wire. The motor manual gives no scale to amperes.
@@ -223,10 +240,15 @@ pub enum State {
 #[derive(Default)]
 pub struct Axis {
     pub motor: Motor,
+    /// Continuous axes unwrap encoder crossings and have no software angle stop.
+    pub continuous_rotation: bool,
+    pub previous_encoder_rad: Option<f32>,
     /// Position loop target in rad.
     pub target_angle_rad: f32,
     /// Speed loop target in rpm, set from the position loop output.
     pub target_rpm: f32,
+    /// Nonzero normalized stick input on the preceding Running tick.
+    pub stick_was_active: bool,
     /// Startup output ceiling for the profiled pitch controller.
     pub output_limit_raw: f32,
     pub pitch_holding: bool,
@@ -251,6 +273,34 @@ pub struct Axis {
 }
 
 impl Axis{
+    /// A single-turn encoder must be unwrapped before position control.
+    pub fn read_yaw_feedback(&mut self, data: &[u8; 8]) {
+        let previous_angle = self.motor.angle_rad;
+        self.motor.read(data);
+        let raw = self.motor.angle_rad;
+        if self.continuous_rotation {
+            self.motor.angle_rad = if let Some(previous_raw) = self.previous_encoder_rad {
+                previous_angle + shortest_angle_error(raw, previous_raw)
+            } else if let Some(reference) = self.reference_angle_rad {
+                reference + shortest_angle_error(raw, reference)
+            } else {
+                raw
+            };
+            self.previous_encoder_rad = Some(raw);
+        } else if let Some(reference) = self.reference_angle_rad {
+            self.motor.angle_rad = reference + shortest_angle_error(raw, reference);
+        }
+    }
+
+    /// Return to the nearest equivalent startup heading, without unwinding whole turns.
+    pub fn recenter_target(&self, reference: f32) -> f32 {
+        if self.continuous_rotation {
+            self.motor.angle_rad + shortest_angle_error(reference, self.motor.angle_rad)
+        } else {
+            reference
+        }
+    }
+
     pub fn calculate_output(&mut self, dt_s: f32) {
         self.target_rpm = self.position_pid.calculate(
             self.target_angle_rad,
@@ -316,21 +366,21 @@ impl Axis{
     }
 
     pub fn update_target_from_stick(&mut self, input: f32, dt_s: f32) -> bool {
-        let min_angle = match self.min_target_angle_rad {
-            Some(angle) => angle,
-            None => return false,
+        let (min_angle, max_angle) = if self.continuous_rotation {
+            (-f32::MAX, f32::MAX)
+        } else {
+            let (Some(min), Some(max)) = (self.min_target_angle_rad, self.max_target_angle_rad) else {
+                return false;
+            };
+            if !min.is_finite() || !max.is_finite() || min >= max {
+                return false;
+            }
+            (min, max)
         };
-    
-        let max_angle = match self.max_target_angle_rad {
-            Some(angle) => angle,
-            None => return false,
-        };
-    
-        if !min_angle.is_finite() || !max_angle.is_finite() || min_angle >= max_angle {
-            return false;
-        }
-    
-        if !self.stick_rate_rad_s.is_finite() {
+
+        if !self.stick_rate_rad_s.is_finite() || !input.is_finite()
+            || !dt_s.is_finite() || dt_s <= 0.0 || !self.motor.angle_rad.is_finite()
+        {
             return false;
         }
     
@@ -338,15 +388,34 @@ impl Axis{
             return false;
         }
     
+        let stick_active = input != 0.0;
+        if self.stick_was_active && !stick_active {
+            // Capture ONCE on release. Repeating this every tick would defeat position hold.
+            self.target_angle_rad = self.motor.angle_rad.clamp(min_angle, max_angle);
+            self.target_rpm = 0.0; // Discard the old pitch slew target so braking starts now.
+            self.position_pid.reset();
+            // Keep the speed-loop integral, especially pitch's gravity-support output.
+            // Only discard derivative history to avoid a setpoint-change D kick.
+            self.speed_pid.previous_error = 0.0;
+            self.speed_pid.has_previous_error = false;
+            self.pitch_holding = false;
+            self.pitch_hold_ticks = 0;
+            self.pitch_hold_target_rad = self.target_angle_rad;
+        }
+        self.stick_was_active = stick_active;
         let change = input * self.stick_rate_rad_s * dt_s;
         let next_target = self.target_angle_rad + change;
     
+        if !next_target.is_finite() { return false; }
         self.target_angle_rad = next_target.clamp(min_angle, max_angle);
     
         true
     }
 
     pub fn current_position_is_allowed(&self) -> bool {
+        if self.continuous_rotation {
+            return self.motor.angle_rad.is_finite() && self.stick_rate_rad_s.is_finite();
+        }
         let min_angle = match self.min_target_angle_rad {
             Some(angle) => angle,
             None => return false,
@@ -403,11 +472,11 @@ impl Axis{
         wants_to_move && output_large && moving_slowly
     }
 
-    pub fn update_stall_detection(&mut self) -> bool {
+    pub fn update_stall_detection(&mut self, min_output_raw: f32) -> bool {
         let suspicious = self.is_stall_candidate(
             STALL_MIN_TARGET_RPM,
             STALL_MAX_ACTUAL_RPM,
-            STALL_MIN_VOLTAGE,
+            min_output_raw,
         );
     
         if suspicious {
@@ -420,6 +489,7 @@ impl Axis{
     }
 
     pub fn reset_control(&mut self){
+        self.stick_was_active = false;
         self.pitch_holding = false;
         self.pitch_hold_ticks = 0;
         self.pitch_hold_target_rad = self.target_angle_rad;
@@ -569,6 +639,7 @@ impl Default for Control {
         Self {
             state: State::Waiting,
             yaw: Axis {
+                continuous_rotation: YAW_CONTINUOUS_ROTATION,
                 position_pid: Pid {
                     kp: YAW_POSITION_KP,
                     ki: YAW_POSITION_KI,
@@ -634,7 +705,7 @@ fn fill_motor_command(data:&mut[u8;8], feedback_id:Option<u16>, command: [u8;2])
 }
 
 fn shortest_angle_error(target:f32, actual:f32) ->f32{
-    let mut error=target-actual;
+    let mut error=(target-actual) % core::f32::consts::TAU;
     let pi = core::f32::consts::PI;
     let tau = core::f32::consts::TAU;
 
@@ -663,6 +734,7 @@ impl Control {
         self.yaw.motor.disable();
         self.pitch.motor.disable();
         for axis in [&mut self.yaw, &mut self.pitch] {
+            axis.stick_was_active = false;
             axis.pitch_holding = false;
             axis.pitch_hold_ticks = 0;
             axis.pitch_hold_target_rad = axis.target_angle_rad;
@@ -678,8 +750,12 @@ impl Control {
             return;
         }
     
-        let yaw_stalled = self.yaw.update_stall_detection();
-        let pitch_stalled = self.pitch.update_stall_detection();
+        let yaw_stalled = self.yaw.update_stall_detection(
+            YAW_STALL_MIN_OUTPUT_RAW,
+        );
+        let pitch_stalled = self.pitch.update_stall_detection(
+            PITCH_STALL_MIN_OUTPUT_RAW,
+        );
     
         if yaw_stalled || pitch_stalled {
             self.disable_all();
@@ -725,9 +801,6 @@ impl Control {
         }
     }
 
-    fn pitch_can_recenter(&self) -> bool {
-        self.pitch.can_recenter_from(PITCH_REST_ANGLE_RAD - PITCH_REST_TOLERANCE_RAD)
-    }
 
     pub fn feedback_is_fresh(&self)->bool{
         let yaw_fresh=self.yaw_feedback_age_ticks < FEEDBACK_TIME_OUT_TICKS;
@@ -844,12 +917,7 @@ impl Control {
                     let angle_raw=u16::from_be_bytes([data[0],data[1]]);
                     if angle_raw>8191{continue;}
                     if Some(feedback_id)== YAW_FEEDBACK_ID{
-                        self.yaw.motor.read(&data);
-                        if let Some(reference) = self.yaw.reference_angle_rad {
-                            let raw_angle = self.yaw.motor.angle_rad;
-                            self.yaw.motor.angle_rad =
-                                reference + shortest_angle_error(raw_angle, reference);
-                        }
+                        self.yaw.read_yaw_feedback(&data);
                         self.yaw_feedback_age_ticks=0;
                     }
                     else if Some(feedback_id)==PITCH_FEEDBACK_ID{
@@ -873,6 +941,18 @@ impl Control {
             None=>false,
         };
 
+        // Running 时右拨杆上拨，主动进入测试故障。
+        if ENABLE_TEST_FAULT
+        && self.state == State::Running
+        && self.remote.is_some_and(|r| r.right_switch == 1)
+        {
+        self.disable_all();
+        self.state = State::Error;
+        self.recovery_armed = false;
+        FAULT_REASON.store(6, Ordering::Relaxed);
+        rtt_target::rprintln!("Test fault -> Error; both outputs cleared");
+        return;
+        }
         if !enable || !self.feedback_is_fresh(){
             self.disable_all();
             if self.state!=State::Error{
@@ -893,7 +973,7 @@ impl Control {
                     self.pitch.reset_control();
 
                     if let Some(angle)=self.yaw.reference_angle_rad{
-                        self.yaw.target_angle_rad=angle;
+                        self.yaw.target_angle_rad=self.yaw.recenter_target(angle);
                     }
                     if let Some(angle)=self.pitch.reference_angle_rad{
                         self.pitch.target_angle_rad=angle;
@@ -951,31 +1031,35 @@ impl Control {
                 if recovery_request {
                     let yaw_allowed = self.yaw.current_position_is_allowed();
                     let pitch_allowed = self.pitch.current_position_is_allowed();
-                    let pitch_recenter_allowed = self.pitch_can_recenter();
-
-                    if yaw_allowed && (pitch_allowed || pitch_recenter_allowed) {
-                        FAULT_REASON.store(0, Ordering::Relaxed);
+            
+                    if yaw_allowed && pitch_allowed {
+                        // 恢复时锁定当前位置，不追赶故障前目标。
                         self.yaw.target_angle_rad = self.yaw.motor.angle_rad;
+                        self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
+            
+                        // 清理 PID、速度目标、保持状态和故障检测计数。
                         self.yaw.reset_control();
                         self.pitch.reset_control();
+            
                         self.prepare_ticks = 0;
                         self.prepare_stable_ticks = 0;
-
-                        if pitch_allowed {
-                            // Preserve recovery at the current pose inside running limits.
-                            self.pitch.target_angle_rad = self.pitch.motor.angle_rad;
-                            self.state = State::Running;
-                            rtt_target::rprintln!("Recovered at current pose");
-                        } else if let Some(reference) = self.pitch.reference_angle_rad {
-                            // At the verified lower rest pose: recenter before Running.
-                            self.pitch.target_angle_rad = reference;
-                            self.state = State::Prepare;
-                            rtt_target::rprintln!("Recovered: pitch recentering from rest");
-                        }
+                        FAULT_REASON.store(0, Ordering::Relaxed);
+            
+                        self.state = State::Running;
+            
+                        rtt_target::rprintln!(
+                            "Recovered -> Running: yaw angle={:.3} target={:.3}; \
+                             pitch angle={:.3} target={:.3}; PID and detectors reset",
+                            self.yaw.motor.angle_rad,
+                            self.yaw.target_angle_rad,
+                            self.pitch.motor.angle_rad,
+                            self.pitch.target_angle_rad,
+                        );
                     } else {
                         rtt_target::rprintln!(
-                            "Recovery refused: yaw_allowed={}, pitch_allowed={}, pitch_recenter_allowed={}",
-                            yaw_allowed, pitch_allowed, pitch_recenter_allowed,
+                            "Recovery refused: yaw_allowed={}, pitch_allowed={}",
+                            yaw_allowed,
+                            pitch_allowed,
                         );
                     }
                 }
@@ -1044,6 +1128,14 @@ impl Control {
 
 
     fn publish_motor_watch(&self) {
+        PREPARE_STABLE_MS.store(self.prepare_stable_ticks, Ordering::Relaxed);
+        YAW_STALL_MS.store(self.yaw.stall_ticks, Ordering::Relaxed);
+        PITCH_STALL_MS.store(self.pitch.stall_ticks, Ordering::Relaxed);
+        YAW_OSC_FREQ_X1000.store((self.yaw.oscillation_frequency_hz * 1000.0) as u32, Ordering::Relaxed);
+        PITCH_OSC_FREQ_X1000.store((self.pitch.oscillation_frequency_hz * 1000.0) as u32, Ordering::Relaxed);
+        YAW_OSC_FAST_MS.store(self.yaw.oscillation_fast_ticks, Ordering::Relaxed);
+        PITCH_OSC_FAST_MS.store(self.pitch.oscillation_fast_ticks, Ordering::Relaxed);
+
         PITCH_HOLDING.store(u32::from(self.pitch.pitch_holding), Ordering::Relaxed);
         YAW_HOLDING.store(
             0,
@@ -1138,7 +1230,7 @@ impl Control {
                 4
             } else if !self.yaw.current_position_is_allowed() {
                 5
-            } else if !self.pitch.current_position_is_allowed() && !self.pitch_can_recenter() {
+            } else if !self.pitch.current_position_is_allowed() {
                 6
             } else if !self.recovery_armed {
                 7

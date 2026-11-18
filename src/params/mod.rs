@@ -11,12 +11,12 @@ use embassy_time::Duration;
 // 速度环：速度误差 rpm → 电压指令原始值。
 
 // ===== Pitch（抬头/低头）：目前实际启用的轴 =====
-pub const PITCH_POSITION_KP: f32 = 15.0; // rpm/rad
+pub const PITCH_POSITION_KP: f32 = 25.0; // rpm/rad
 pub const PITCH_SPEED_KP: f32 = 200.0;
 pub const PITCH_SPEED_KI: f32 = 6000.0; // output counts / (rpm * second)
 pub const PITCH_I_LIMIT_RAW: f32 = 10000.0; // 积分项输出的限幅，不是积分状态限幅
 pub const PITCH_MAX_RPM: f32 = 10.0;
-pub const PITCH_ACCEL_RPM_S: f32 = 9.0;
+pub const PITCH_ACCEL_RPM_S: f32 = 15.0;
 pub const PITCH_OUTPUT_RAMP_RAW_S: f32 = 7000.0; // 输出上限每秒增加 1000，9 秒达到 9000
 
 pub const PITCH_POSITION_KI: f32 = 0.0;
@@ -48,8 +48,6 @@ pub const RUNNING_MAX_RPM: f32 = 10.0;
 pub const RUNNING_MAX_VOLTAGE: f32 = 12000.0;
 
 // ===== 3. 回正判定 =====
-pub const PITCH_REST_ANGLE_RAD: f32 = 0.826049;
-pub const PITCH_REST_TOLERANCE_RAD: f32 = 2.0 * core::f32::consts::TAU / 8192.0;
 pub const PREPARE_ANGLE_TOLERANCE_RAD: f32 = 0.02;
 pub const PREPARE_SPEED_TOLERANCE_RPM: f32 = 2.0;
 pub const PREPARE_STABLE_TICKS: u32 = 200;
@@ -58,7 +56,9 @@ pub const PREPARE_TIMEOUT_TICKS: u32 = 30000;
 // ===== 4. 堵转检测 =====
 pub const STALL_MIN_TARGET_RPM: f32 = 1.0;
 pub const STALL_MAX_ACTUAL_RPM: f32 = 1.0;
-pub const STALL_MIN_VOLTAGE: f32 = 8500.0; // 输出较小时不计为堵转
+// 协议输出原始值，不是伏特；这是待测试的初始阈值。
+pub const YAW_STALL_MIN_OUTPUT_RAW: f32 = 5000.0;
+pub const PITCH_STALL_MIN_OUTPUT_RAW: f32 = 8500.0;
 pub const STALL_DURATION_TICKS: u32 = 1000;
 
 // ===== 5. 振荡检测 =====
@@ -77,19 +77,21 @@ pub const TICK: Duration = Duration::from_millis(1);
 
 // ===== 7. 零位和目标角度范围（按实物标定） =====
 // 与原代码一致：目标和反馈仍使用电机绝对角度 rad。
+// true: yaw 连续跨圈，以下 yaw min/max 仅在 false 时生效；pitch 限位不变。
+pub const YAW_CONTINUOUS_ROTATION: bool = true;
 pub const YAW_REFERENCE_ANGLE_RAD: f32 = 1508.0 * core::f32::consts::TAU / 8192.0;
 pub const YAW_MIN_TARGET_ANGLE_RAD: f32 = YAW_REFERENCE_ANGLE_RAD - core::f32::consts::FRAC_PI_2;
 pub const YAW_MAX_TARGET_ANGLE_RAD: f32 = YAW_REFERENCE_ANGLE_RAD + core::f32::consts::FRAC_PI_2;
 pub const PITCH_REFERENCE_ANGLE_RAD: f32 = 1480.0 * core::f32::consts::TAU / 8192.0;
-pub const PITCH_MIN_TARGET_ANGLE_RAD: f32 = PITCH_REFERENCE_ANGLE_RAD - 0.25;
+pub const PITCH_MIN_TARGET_ANGLE_RAD: f32 = PITCH_REFERENCE_ANGLE_RAD - 0.32;
 pub const PITCH_MAX_TARGET_ANGLE_RAD: f32 = PITCH_REFERENCE_ANGLE_RAD + 0.18;
 
 // ===== 8. 遥控目标变化 =====
 pub const STICK_DEADZONE: f32 = 0.05;
-// Running 时左摇杆改变目标角度；松手保持松手时的目标，Prepare 不受摇杆影响。
+// Running 时左摇杆改变目标角度；回中瞬间锁定当前实际位置，Prepare 不受摇杆影响。
 // 带符号的 rad/s；正负号决定摇杆与目标变化的对应方向。
-pub const YAW_STICK_RATE_RAD_S: f32 = -1.0; // 满杆约 17.2 度/秒；反向时改为负值
-pub const PITCH_STICK_RATE_RAD_S: f32 = 0.45; // 满杆约 8.6 度/秒；反向时改为负值
+pub const YAW_STICK_RATE_RAD_S: f32 = -1.0; // 满杆约 57.3 度/秒；反向时改为负值
+pub const PITCH_STICK_RATE_RAD_S: f32 = -0.45; // 满杆约 25.8 度/秒；反向时改为负值
 
 
 
@@ -101,3 +103,6 @@ pub const PITCH_HOLD_EXIT_RAD: f32 = 0.020; // 20 mrad，约 1.15 度
 pub const PITCH_HOLD_ENTER_RPM: f32 = 1.0;
 pub const PITCH_HOLD_EXIT_RPM: f32 = 2.0;
 pub const PITCH_HOLD_STABLE_TICKS: u32 = 200;
+
+// 临时故障注入：测试结束后改回 false。
+pub const ENABLE_TEST_FAULT: bool = false;
